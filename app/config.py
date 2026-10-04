@@ -13,6 +13,10 @@ COPY_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_SEGMENT_SIZE", "16"))
 COPY_MAX_SEGMENT_SIZE = int(os.environ.get("ORIGIN_COPY_MAX_SEGMENT_SIZE", "1024"))
 # Upper bound for object paths accepted by one revision-GC request.
 GC_MAX_PATHS = int(os.environ.get("ORIGIN_GC_MAX_PATHS", "100"))
+# Bounds for one POST /compositions request: the ordered list of source
+# segments concatenated into the new target revision.
+COMPOSITION_MIN_SEGMENTS = int(os.environ.get("ORIGIN_COMPOSITION_MIN_SEGMENTS", "1"))
+COMPOSITION_MAX_SEGMENTS = int(os.environ.get("ORIGIN_COMPOSITION_MAX_SEGMENTS", "100"))
 # Allowed lifetime window of a historical-revision lease (seconds).
 LEASE_MIN_TTL = int(os.environ.get("ORIGIN_LEASE_MIN_TTL", "60"))
 LEASE_MAX_TTL = int(os.environ.get("ORIGIN_LEASE_MAX_TTL", "86400"))

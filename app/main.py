@@ -43,6 +43,21 @@ A per-path revision high-water mark keeps numbers monotonic when a
 moved-away path is later re-PUT or reused as a target, even after /gc
 has removed every leftover revision.
 
+Object composition (``POST /compositions``) publishes a new target
+revision whose bytes are the ordered concatenation of 1..100 half-open
+byte slices of source revisions the client pins by revision number and
+strong ETag, optionally requiring the target to still match a baseline
+(null when absent).  One transaction inserts only the target
+placeholder, locks every distinct source row and the target row in a
+single ascending-path FOR UPDATE statement (the same global order every
+writer uses, so overlapping compositions cannot deadlock), and only then
+resolves the immutable pinned revisions -- historical revisions, a
+moved-away path's leftovers and the target path's own old revision all
+resolve identically -- verifies existence (404), ETags and baseline
+(412) and interval bounds (400), reads the slices and publishes.  Any
+failure rolls back without a target revision; concurrent PUTs cannot
+mix in newer bytes and /gc cannot delete an in-use source revision.
+
 The object index (``GET /object-index``) lists current objects in
 ascending path order via ten-minute snapshots.  The first request for a
 (prefix, limit) walks the objects with an unlocked read and
@@ -75,6 +90,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import db as database
 from .config import (
+    COMPOSITION_MAX_SEGMENTS,
+    COMPOSITION_MIN_SEGMENTS,
     COPY_MAX_SEGMENT_SIZE,
     COPY_SEGMENT_SIZE,
     DATABASE_URL,
@@ -730,6 +747,387 @@ async def move_object(request: Request):
             "ETag": str(make_etag(digest)),
             "Last-Modified": http_date(created_at),
             "X-Revision-No": str(target_revision_no),
+        },
+    )
+
+
+# ---- object composition -------------------------------------------------------
+
+
+def _composition_bad_request(detail: str, **extra) -> JSONResponse:
+    return JSONResponse({"detail": detail, **extra}, status_code=400)
+
+
+def _is_int(value) -> bool:
+    """JSON integer (booleans are NOT integers here, matching every other
+    endpoint's positive-integer validation)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(slots=True)
+class _CompositionSegment:
+    """One structurally validated source segment of a composition
+    request (the interval is checked against the stored revision length
+    only after the object rows are locked)."""
+
+    index: int
+    path: str
+    revision_no: int
+    etag: object
+    start: int
+    end: int
+
+
+@app.post("/compositions", status_code=201)
+async def create_composition(request: Request):
+    """Compose a target revision from pinned source segments.
+
+    Request body::
+
+        {
+          "target_path": "<non-empty path>",
+          "target_baseline": null
+              | {"revision_no": <positive int>, "etag": "<strong ETag>"},
+          "media_type": "<non-empty media type>",
+          "segments": [
+            {"path": "<source path>", "revision_no": <positive int>,
+             "etag": "<strong ETag>", "start": <int >= 0>,
+             "end": <int > start>},
+            ... 1..100 entries, concatenated in order
+          ]
+        }
+
+    Every segment names the source revision by number AND strong ETag and
+    a half-open byte interval ``[start, end)``; the same source revision
+    may supply multiple segments, in any position.  One transaction locks
+    every distinct source object row and the target row in a single
+    ascending-path FOR UPDATE statement (the same global lock order PUT,
+    moves, copy sessions, GC and leases use), then -- under the locks --
+    resolves every pinned revision (immutable revision rows, so a moved
+    or re-published path still serves the exact old revision), verifies
+    every strong ETag, the target baseline and every interval against the
+    stored revision length, concatenates the original bytes in order, and
+    publishes the target's next revision.  Response 201 carries the new
+    revision number, strong ETag and total byte count.
+
+    Status codes:
+
+    * 400 -- malformed body, an empty segment (``start == end``) or an
+      interval outside ``[0, length]``;
+    * 404 -- a named source revision is not stored (unknown path,
+      moved-away number that never existed, or already collected);
+    * 412 -- a source strong ETag does not match its pinned revision, or
+      the target's current revision no longer matches ``target_baseline``;
+    * 201 -- composed and published atomically.
+
+    Any failure rolls the whole transaction back: no target revision is
+    published and no placeholder row is left behind.  Because all locks
+    are taken first in one ordered statement, a concurrent PUT can
+    neither mix newer bytes into the result nor starve between two lock
+    acquisitions, /gc waits on the same locks and therefore cannot delete
+    an in-use source revision, paths being migrated (POST /moves)
+    serialise on the same rows, and overlapping compositions can never
+    deadlock.  When target and source share a path, the segments are
+    still read from the explicitly named (possibly historical) revision,
+    not from the new revision being published.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _composition_bad_request("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _composition_bad_request("request body must be a JSON object")
+
+    target_path = body.get("target_path")
+    if not isinstance(target_path, str) or not target_path:
+        return _composition_bad_request(
+            "target_path must be a non-empty string"
+        )
+
+    media_type = body.get("media_type")
+    if not isinstance(media_type, str) or not media_type:
+        return _composition_bad_request(
+            "media_type must be a non-empty string"
+        )
+
+    if "target_baseline" not in body:
+        return _composition_bad_request(
+            "target_baseline is required (null or {revision_no, etag})"
+        )
+    raw_baseline = body.get("target_baseline")
+    baseline_no: int | None = None
+    baseline_etag = None
+    if raw_baseline is not None:
+        if not isinstance(raw_baseline, dict):
+            return _composition_bad_request(
+                "target_baseline must be null or an object"
+            )
+        baseline_no = raw_baseline.get("revision_no")
+        if not _is_int(baseline_no) or baseline_no < 1:
+            return _composition_bad_request(
+                "target_baseline.revision_no must be a positive integer"
+            )
+        raw_baseline_etag = raw_baseline.get("etag")
+        if not isinstance(raw_baseline_etag, str) or not raw_baseline_etag:
+            return _composition_bad_request(
+                "target_baseline.etag must be a non-empty string"
+            )
+        baseline_etag = parse_etag(raw_baseline_etag)
+        if baseline_etag is None or baseline_etag.weak:
+            # The baseline pins the exact revision the client last saw;
+            # only the strong validator returned by GET/PUT proves it.
+            return _composition_bad_request(
+                "target_baseline.etag must be a strong entity-tag"
+            )
+
+    raw_segments = body.get("segments")
+    if (
+        not isinstance(raw_segments, list)
+        or not COMPOSITION_MIN_SEGMENTS
+        <= len(raw_segments)
+        <= COMPOSITION_MAX_SEGMENTS
+    ):
+        return _composition_bad_request(
+            f"segments must be a list of {COMPOSITION_MIN_SEGMENTS} to "
+            f"{COMPOSITION_MAX_SEGMENTS} entries"
+        )
+
+    segments: list[_CompositionSegment] = []
+    # Structural validation only here; empty/out-of-bounds intervals are
+    # semantic 400s decided inside the locks (404/412 precedence), once
+    # the pinned revision lengths are known.
+    for index, raw in enumerate(raw_segments):
+        if not isinstance(raw, dict):
+            return _composition_bad_request(
+                f"segments[{index}] must be an object", index=index
+            )
+        path = raw.get("path")
+        if not isinstance(path, str) or not path:
+            return _composition_bad_request(
+                f"segments[{index}].path must be a non-empty string",
+                index=index,
+            )
+        revision_no = raw.get("revision_no")
+        if not _is_int(revision_no) or revision_no < 1:
+            return _composition_bad_request(
+                f"segments[{index}].revision_no must be a positive integer",
+                index=index,
+            )
+        raw_etag = raw.get("etag")
+        if not isinstance(raw_etag, str) or not raw_etag:
+            return _composition_bad_request(
+                f"segments[{index}].etag must be a non-empty string",
+                index=index,
+            )
+        etag = parse_etag(raw_etag)
+        if etag is None or etag.weak:
+            return _composition_bad_request(
+                f"segments[{index}].etag must be a strong entity-tag",
+                index=index,
+            )
+        start, end = raw.get("start"), raw.get("end")
+        if not _is_int(start) or start < 0:
+            return _composition_bad_request(
+                f"segments[{index}].start must be a non-negative integer",
+                index=index,
+            )
+        if not _is_int(end) or end < 0:
+            return _composition_bad_request(
+                f"segments[{index}].end must be a non-negative integer",
+                index=index,
+            )
+        if start > end:
+            return _composition_bad_request(
+                f"segments[{index}] start must not exceed end",
+                index=index,
+                start=start,
+                end=end,
+            )
+        segments.append(
+            _CompositionSegment(index, path, revision_no, etag, start, end)
+        )
+
+    pool = request.app.state.pool
+    conn = await pool.acquire()
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        try:
+            # The lock-ordering verdict: insert ONLY the target placeholder
+            # (sources must never be created), then take every row in one
+            # ascending-path FOR UPDATE statement before touching revisions.
+            locked = await database.lock_composition_paths(
+                conn, [s.path for s in segments], target_path
+            )
+
+            # 404 first: every named source revision must still be stored.
+            # Resolve each segment by (path, revision_no); the same
+            # revision repeated in several segments resolves to the same
+            # immutable row.
+            resolved: dict[tuple[str, int], database.CurrentRevision] = {}
+            missing: list[dict] = []
+            for seg in segments:
+                key = (seg.path, seg.revision_no)
+                if key not in resolved:
+                    rev = await database.fetch_revision_for_composition(
+                        conn, seg.path, seg.revision_no
+                    )
+                    if rev is None:
+                        missing.append(
+                            {
+                                "index": seg.index,
+                                "path": seg.path,
+                                "revision_no": seg.revision_no,
+                            }
+                        )
+                    else:
+                        resolved[key] = rev
+            if missing:
+                await tx.rollback()
+                return JSONResponse(
+                    {"detail": "source_revision_not_found", "missing": missing},
+                    status_code=404,
+                )
+
+            # 412 next, source validators first: each segment's strong
+            # ETag must match the pinned revision's stored digest.  Every
+            # mismatch is reported, in request order.
+            source_mismatches: list[dict] = []
+            for seg in segments:
+                rev = resolved[(seg.path, seg.revision_no)]
+                if seg.etag.opaque != rev.sha256:
+                    source_mismatches.append(
+                        {
+                            "index": seg.index,
+                            "path": seg.path,
+                            "revision_no": seg.revision_no,
+                            "expected_etag": str(seg.etag),
+                            "actual_etag": str(make_etag(rev.sha256)),
+                        }
+                    )
+            if source_mismatches:
+                await tx.rollback()
+                return JSONResponse(
+                    {
+                        "detail": "precondition_failed",
+                        "source_mismatches": source_mismatches,
+                    },
+                    status_code=412,
+                )
+
+            # 412, target baseline second: compare the locked target's
+            # CURRENT revision identity (null baseline means it must still
+            # be absent; a non-null baseline pins revision number and
+            # strong ETag).
+            target = locked[target_path]
+            target_mismatch: dict | None = None
+            if baseline_no is None:
+                if target.current_id is not None:
+                    target_mismatch = {
+                        "reason": "expected_absent",
+                        "current_revision_no": target.revision_no,
+                        "current_etag": str(make_etag(target.sha256)),
+                    }
+            else:
+                mismatches = []
+                if target.current_id is None:
+                    target_mismatch = {
+                        "reason": "target_absent",
+                        "expected_revision_no": baseline_no,
+                        "expected_etag": str(baseline_etag),
+                        "current_revision_no": None,
+                        "current_etag": None,
+                    }
+                else:
+                    if target.revision_no != baseline_no:
+                        mismatches.append("revision_no")
+                    if target.sha256 != baseline_etag.opaque:
+                        mismatches.append("etag")
+                    if mismatches:
+                        target_mismatch = {
+                            "reason": "baseline_mismatch",
+                            "mismatches": mismatches,
+                            "expected_revision_no": baseline_no,
+                            "expected_etag": str(baseline_etag),
+                            "current_revision_no": target.revision_no,
+                            "current_etag": str(make_etag(target.sha256)),
+                        }
+            if target_mismatch is not None:
+                await tx.rollback()
+                headers = (
+                    {"ETag": str(make_etag(target.sha256))}
+                    if target.sha256 is not None
+                    else {}
+                )
+                return JSONResponse(
+                    {
+                        "detail": "precondition_failed",
+                        "target_path": target_path,
+                        "target": target_mismatch,
+                    },
+                    status_code=412,
+                    headers=headers,
+                )
+
+            # Semantic 400 last: every interval must be non-empty and lie
+            # within the stored revision (half-open [start, end)).
+            parts: list[tuple[database.CurrentRevision, int, int]] = []
+            for seg in segments:
+                rev = resolved[(seg.path, seg.revision_no)]
+                if seg.start == seg.end:
+                    await tx.rollback()
+                    return _composition_bad_request(
+                        f"segments[{seg.index}] must not be empty",
+                        index=seg.index,
+                        path=seg.path,
+                        revision_no=seg.revision_no,
+                        start=seg.start,
+                        end=seg.end,
+                        length=rev.length,
+                    )
+                if seg.end > rev.length:
+                    await tx.rollback()
+                    return _composition_bad_request(
+                        f"segments[{seg.index}] is out of bounds",
+                        index=seg.index,
+                        path=seg.path,
+                        revision_no=seg.revision_no,
+                        start=seg.start,
+                        end=seg.end,
+                        length=rev.length,
+                    )
+                parts.append((rev, seg.start, seg.end))
+
+            # Concatenate the original bytes strictly in request order,
+            # then publish one new target revision and commit -- the only
+            # moment a revision becomes visible.
+            chunks = [
+                await database.fetch_revision_slice(conn, rev.id, start, end)
+                for rev, start, end in parts
+            ]
+            content = b"".join(chunks)
+            digest, revision_no, created_at = await database.publish_revision(
+                conn, target_path, content, media_type
+            )
+            await tx.commit()
+        except Exception:
+            await tx.rollback()
+            raise
+    finally:
+        await pool.release(conn)
+
+    return JSONResponse(
+        {
+            "target_path": target_path,
+            "revision_no": revision_no,
+            "etag": str(make_etag(digest)),
+            "bytes": len(content),
+        },
+        status_code=201,
+        headers={
+            "ETag": str(make_etag(digest)),
+            "Last-Modified": http_date(created_at),
+            "X-Revision-No": str(revision_no),
         },
     )
 

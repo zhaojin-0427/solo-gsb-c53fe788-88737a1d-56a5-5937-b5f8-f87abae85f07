@@ -49,6 +49,21 @@ path order.  The per-path ``revision_seq`` high-water mark keeps
 revision numbers monotonic after a move-away even when /gc later removes
 every leftover revision row.
 
+Object composition (``POST /compositions``) publishes a target revision
+whose bytes are the ordered concatenation of half-open byte slices of
+pinned source revisions.  One transaction inserts the target placeholder
+(never source rows: a missing source must stay a 404 and a rolled-back
+composition leaves no trace), locks every distinct source row AND the
+target row in a single ascending-path FOR UPDATE statement -- the same
+global order every other writer uses, so two compositions with swapped
+lock sets cannot deadlock -- and only then resolves the pinned
+revisions by (path, revision_no), checks every strong ETag and the
+target baseline, reads the slices and publishes.  The held locks mean a
+concurrent PUT can neither replace a pinned revision nor slip new bytes
+into the concatenation, /gc cannot delete an in-use source revision,
+and a pinned revision of a moved-away path or the target's own old
+revision (target == source path) resolves exactly like any other.
+
 Revision leases (``POST /revision-leases``) are a fourth GC retention
 reason on equal footing with the current revision, manifests and
 baselines.  Lease creation takes the owning object row FOR UPDATE
@@ -364,6 +379,133 @@ async def detach_object(conn: asyncpg.Connection, path: str) -> None:
     await conn.execute(
         "UPDATE objects SET current_id = NULL WHERE path = $1", path
     )
+
+
+# ---- object composition -------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CompositionLock:
+    """Snapshot of one object row locked for ``POST /compositions``.
+
+    The row was taken ``FOR UPDATE`` in the single globally ordered lock
+    statement.  Revision columns are populated from the row's CURRENT
+    revision (the target baseline is compared against it); they are NULL
+    for a path with no current revision -- an absent path, an empty
+    placeholder left by session creation, or a moved-away path.
+    """
+
+    path: str
+    current_id: int | None
+    revision_no: int | None
+    sha256: str | None
+    revision_seq: int
+
+
+async def lock_composition_paths(
+    conn: asyncpg.Connection, source_paths: list[str], target_path: str
+) -> dict[str, CompositionLock]:
+    """Lock every object row a composition touches, in ascending path order.
+
+    A placeholder row is inserted ONLY for the target path (it may be
+    published into by this very request); source paths are never created
+    -- a missing source revision must stay missing and answer 404, and a
+    rolled-back composition must not leave placeholders behind that turn
+    a genuinely absent path into a GC-recognised one.  The same path
+    serving as both target and source is inserted once and locked once.
+
+    All rows -- sources and target -- are locked by ONE statement in
+    ascending path order, the very same global order every other writer
+    uses (PUT, moves, session creation's FOR SHARE set, acknowledge, GC
+    execute and lease creation).  This is the deliberate verdict on lock
+    ordering:
+
+    * locking source rows FOR SHARE and the target FOR UPDATE in two
+      statements would deadlock when two compositions exchange/s overlap
+      lock sets (one holds SHARE-on-a waiting for UPDATE-on-b while the
+      other holds SHARE-on-b waiting for UPDATE-on-a);
+    * a single ordered FOR UPDATE set instead serialises whole
+      compositions against each other and against PUTs, moves and GC, so
+      neither new bytes (a revision published after the source revision
+      was pinned) nor a GC deletion can race the segment reads, and no
+      lock cycle is possible.
+
+    Only after every lock is held are revisions (current of each row,
+    and the pinned historical source revisions) read by a separate
+    statement, so the reads cannot go stale before the composition is
+    decided.
+    """
+    await conn.execute(
+        "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        target_path,
+    )
+    rows = await conn.fetch(
+        """
+        SELECT o.path, o.current_id, o.revision_seq,
+               r.revision_no, r.sha256
+          FROM objects o
+          LEFT JOIN revisions r ON r.id = o.current_id
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        sorted(set(source_paths + [target_path])),
+    )
+    return {
+        r["path"]: CompositionLock(
+            path=r["path"],
+            current_id=r["current_id"],
+            revision_no=r["revision_no"],
+            sha256=r["sha256"],
+            revision_seq=r["revision_seq"],
+        )
+        for r in rows
+    }
+
+
+async def fetch_revision_for_composition(
+    conn: asyncpg.Connection, path: str, revision_no: int
+) -> CurrentRevision | None:
+    """Fetch one still-stored revision of a locked source path.
+
+    Revisions are immutable rows identified by ``(object_path,
+    revision_no)``; the caller already holds the object row's FOR UPDATE
+    lock, so a row found here cannot be deleted by GC before this
+    transaction commits (GC needs the same FOR UPDATE lock) and cannot
+    change content or ETag.  A moved-away path's detached historical
+    revisions resolve normally; a number already collected by /gc -- or
+    never assigned -- resolves to None (HTTP 404).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT r.id, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, r.created_at
+          FROM revisions r
+         WHERE r.object_path = $1 AND r.revision_no = $2
+        """,
+        path,
+        revision_no,
+    )
+    return None if row is None else _to_revision(row)
+
+
+async def fetch_revision_slice(
+    conn: asyncpg.Connection, revision_id: int, start: int, end: int
+) -> bytes:
+    """Bytes ``[start, end)`` of an immutable revision (0-based, half-open).
+
+    SQL ``substring`` positions are 1-based.  Callers must hold the
+    owning object row lock and must have validated
+    ``0 <= start < end <= length`` (an empty or out-of-bounds segment is
+    a 400).
+    """
+    chunk = await conn.fetchval(
+        "SELECT substring(content FROM $2 FOR $3) FROM revisions WHERE id = $1",
+        revision_id,
+        start + 1,
+        end - start,
+    )
+    return b"" if chunk is None else bytes(chunk)
 
 
 # ---- copy sessions -----------------------------------------------------------
