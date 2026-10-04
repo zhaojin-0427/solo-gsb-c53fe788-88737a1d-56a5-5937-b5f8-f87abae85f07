@@ -65,6 +65,20 @@ and revision existence; the transaction and share lock are held until
 the last streamed byte, so expiry/release during a read never tears the
 response, and a DELETE-based release is idempotent.
 
+Object compositions (``POST /compositions``) pin their whole read/write
+scope in one lock set: a placeholder row is inserted for the target path
+only, then every involved object row -- target and source paths alike --
+is locked ``FOR UPDATE`` in one ascending-path statement (the same
+global order every writer uses).  One lock strength and one acquisition
+order are the deadlock ruling: a composition racing a PUT, a move,
+another composition or /gc serialises on the first shared row instead of
+cycling, and while the locks are held GC execute cannot delete a source
+revision whose bytes are being copied.  Source fragments are then read
+by (path, revision number) from the immutable ``revisions`` table, so a
+source path that is also the composition target still contributes the
+bytes of the old revision the client named, and a concurrent publish
+can never mix new bytes into the concatenation.
+
 Object index snapshots (``GET /object-index``) take a different,
 deliberately lock-free path: the first request for a (prefix, limit)
 walks the current objects with a plain unlocked ``SELECT`` (so the
@@ -364,6 +378,112 @@ async def detach_object(conn: asyncpg.Connection, path: str) -> None:
     await conn.execute(
         "UPDATE objects SET current_id = NULL WHERE path = $1", path
     )
+
+
+# ---- object compositions -------------------------------------------------------
+
+
+async def lock_composition_scope(
+    conn: asyncpg.Connection, target_path: str, source_paths: list[str]
+) -> None:
+    """Pin a composition's whole read/write scope in one global-order lock set.
+
+    A placeholder row is inserted for the TARGET only: a composition may
+    publish to a path that does not exist yet, and concurrent first
+    publishers must serialise on the same primary-key row.  Source paths
+    never get placeholders -- a source without an object row has no
+    revisions (object rows are never deleted) and is answered 404, and a
+    failed composition must leave no trace behind.
+
+    Every involved row -- target and sources alike -- is then locked
+    ``FOR UPDATE`` in one ascending-path statement, the same global order
+    publishers, moves, session creation/acks, lease creation and GC
+    execute use.  Uniform ``FOR UPDATE`` (rather than a weaker share lock
+    for sources) keeps every transaction on ONE lock strength and ONE
+    acquisition order: two compositions with swapped source/target roles,
+    or a composition racing a move, serialise instead of deadlocking on a
+    share-to-update upgrade.  While the locks are held, GC execute (which
+    needs the same rows ``FOR UPDATE``) cannot delete any revision of
+    these paths, so the source revisions verified next survive until the
+    composed bytes are committed.
+    """
+    await conn.execute(
+        "INSERT INTO objects (path) VALUES ($1) ON CONFLICT (path) DO NOTHING",
+        target_path,
+    )
+    await conn.execute(
+        """
+        SELECT o.path
+          FROM objects o
+         WHERE o.path = ANY($1::text[])
+         ORDER BY o.path ASC
+         FOR UPDATE OF o
+        """,
+        sorted({target_path, *source_paths}),
+    )
+
+
+async def current_revision_locked(
+    conn: asyncpg.Connection, path: str
+) -> CurrentRevision | None:
+    """Current revision of ``path``; the caller already holds the row lock.
+
+    A plain read with no lock clause of its own, for callers that take
+    every lock up front in one statement (``lock_composition_scope``).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT r.id, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, r.created_at
+          FROM objects o
+          JOIN revisions r ON r.id = o.current_id
+         WHERE o.path = $1
+        """,
+        path,
+    )
+    return None if row is None else _to_revision(row)
+
+
+async def fetch_stored_revision(
+    conn: asyncpg.Connection, path: str, revision_no: int
+) -> CurrentRevision | None:
+    """One specific revision of ``path``; the caller holds the row lock.
+
+    This is the revision read layer compositions and lease creation
+    share: revisions are immutable, and the caller's lock on the owning
+    object row keeps GC execute from deleting the row for the rest of
+    the transaction, so a revision found here stays readable until
+    commit.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT r.id, r.revision_no, r.sha256, r.media_type,
+               octet_length(r.content) AS length, r.created_at
+          FROM revisions r
+         WHERE r.object_path = $1 AND r.revision_no = $2
+        """,
+        path,
+        revision_no,
+    )
+    return None if row is None else _to_revision(row)
+
+
+async def fetch_revision_slice(
+    conn: asyncpg.Connection, revision_id: int, start: int, end: int
+) -> bytes:
+    """Bytes ``[start, end)`` of a revision (half-open, end exclusive).
+
+    ``substring(bytea FROM ... FOR ...)`` uses 1-based positions, hence
+    the ``start + 1``.  Callers have already bounds-checked
+    ``0 <= start < end <= length`` against the locked revision.
+    """
+    chunk = await conn.fetchval(
+        "SELECT substring(content FROM $2 FOR $3) FROM revisions WHERE id = $1",
+        revision_id,
+        start + 1,
+        end - start,
+    )
+    return bytes(chunk)
 
 
 # ---- copy sessions -----------------------------------------------------------

@@ -43,6 +43,20 @@ A per-path revision high-water mark keeps numbers monotonic when a
 moved-away path is later re-PUT or reused as a target, even after /gc
 has removed every leftover revision.
 
+Object compositions (``POST /compositions``) assemble a new target
+revision from ordered byte fragments of still-stored source revisions.
+One transaction locks every involved object row -- the target and all
+source paths -- FOR UPDATE in a single ascending-path statement (a
+placeholder row is inserted for the target only), checks the client's
+target baseline against the locked current revision, verifies each
+pinned source revision and its strong ETag, copies the half-open
+[start, end) fragments in request order and publishes their
+concatenation as the target's next revision.  The uniform lock set is
+what keeps a composition serialised against concurrent PUTs, moves and
+/gc without deadlocks and without letting reclamation delete a source
+whose bytes are being copied; any failure rolls the whole transaction
+back, leaving no target revision behind.
+
 The object index (``GET /object-index``) lists current objects in
 ascending path order via ten-minute snapshots.  The first request for a
 (prefix, limit) walks the objects with an unlocked read and
@@ -75,6 +89,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import db as database
 from .config import (
+    COMPOSITION_MAX_SOURCES,
     COPY_MAX_SEGMENT_SIZE,
     COPY_SEGMENT_SIZE,
     DATABASE_URL,
@@ -730,6 +745,295 @@ async def move_object(request: Request):
             "ETag": str(make_etag(digest)),
             "Last-Modified": http_date(created_at),
             "X-Revision-No": str(target_revision_no),
+        },
+    )
+
+
+# ---- object compositions -------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CompositionSource:
+    """One validated source fragment of a composition request."""
+
+    path: str
+    revision_no: int
+    etag_opaque: str          # opaque tag of the client's strong ETag
+    start: int                # inclusive
+    end: int                  # exclusive
+
+
+def _composition_bad_request(detail: str) -> JSONResponse:
+    return JSONResponse({"detail": detail}, status_code=400)
+
+
+def _parse_composition(body) -> tuple | JSONResponse:
+    """Validate a composition request body.
+
+    Returns ``(target_path, baseline, media_type, sources)`` where
+    ``baseline`` is ``None`` (the client asserts the target does not
+    exist) or a ``(revision_no, etag_opaque)`` pair; a JSONResponse is
+    returned instead on the first validation failure (HTTP 400).
+    """
+    if not isinstance(body, dict):
+        return _composition_bad_request("request body must be a JSON object")
+
+    target_path = body.get("target_path")
+    if not isinstance(target_path, str) or not target_path:
+        return _composition_bad_request("target_path must be a non-empty string")
+
+    if "target_baseline" not in body:
+        return _composition_bad_request(
+            "target_baseline is required"
+            " (null when the target must not exist)"
+        )
+    baseline_raw = body["target_baseline"]
+    baseline = None
+    if baseline_raw is not None:
+        if not isinstance(baseline_raw, dict):
+            return _composition_bad_request(
+                "target_baseline must be null or an object"
+                " with revision_no and etag"
+            )
+        baseline_no = baseline_raw.get("revision_no")
+        if (
+            not isinstance(baseline_no, int)
+            or isinstance(baseline_no, bool)
+            or baseline_no < 1
+        ):
+            return _composition_bad_request(
+                "target_baseline.revision_no must be a positive integer"
+            )
+        baseline_etag_raw = baseline_raw.get("etag")
+        if not isinstance(baseline_etag_raw, str) or not baseline_etag_raw:
+            return _composition_bad_request(
+                "target_baseline.etag must be a non-empty string"
+            )
+        baseline_etag = parse_etag(baseline_etag_raw)
+        if baseline_etag is None or baseline_etag.weak:
+            # Only a strong validator pins the exact current revision.
+            return _composition_bad_request(
+                "target_baseline.etag must be a strong entity-tag"
+            )
+        baseline = (baseline_no, baseline_etag.opaque)
+
+    media_type = body.get("media_type")
+    if not isinstance(media_type, str) or not media_type:
+        return _composition_bad_request("media_type must be a non-empty string")
+
+    sources_raw = body.get("sources")
+    if (
+        not isinstance(sources_raw, list)
+        or not sources_raw
+        or len(sources_raw) > COMPOSITION_MAX_SOURCES
+    ):
+        return _composition_bad_request(
+            f"sources must be a list of 1 to {COMPOSITION_MAX_SOURCES}"
+            " fragments"
+        )
+    sources: list[CompositionSource] = []
+    for index, item in enumerate(sources_raw):
+        if not isinstance(item, dict):
+            return _composition_bad_request(f"sources[{index}] must be an object")
+        source_path = item.get("path")
+        if not isinstance(source_path, str) or not source_path:
+            return _composition_bad_request(
+                f"sources[{index}].path must be a non-empty string"
+            )
+        revision_no = item.get("revision_no")
+        if (
+            not isinstance(revision_no, int)
+            or isinstance(revision_no, bool)
+            or revision_no < 1
+        ):
+            return _composition_bad_request(
+                f"sources[{index}].revision_no must be a positive integer"
+            )
+        etag_raw = item.get("etag")
+        if not isinstance(etag_raw, str) or not etag_raw:
+            return _composition_bad_request(
+                f"sources[{index}].etag must be a non-empty string"
+            )
+        etag = parse_etag(etag_raw)
+        if etag is None or etag.weak:
+            return _composition_bad_request(
+                f"sources[{index}].etag must be a strong entity-tag"
+            )
+        start = item.get("start")
+        end = item.get("end")
+        for name, value in (("start", start), ("end", end)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return _composition_bad_request(
+                    f"sources[{index}].{name} must be a non-negative integer"
+                )
+        if end <= start:
+            # An empty (or reversed) fragment contributes no bytes and is
+            # virtually always a client bug: reject it outright.
+            return _composition_bad_request(
+                f"sources[{index}] must satisfy start < end"
+                f" (got start={start}, end={end})"
+            )
+        sources.append(
+            CompositionSource(source_path, revision_no, etag.opaque, start, end)
+        )
+    return target_path, baseline, media_type, sources
+
+
+@app.post("/compositions", status_code=201)
+async def create_composition(request: Request):
+    """Compose a new target revision from fragments of stored revisions.
+
+    The request names the target path, a target baseline (``null`` when
+    the target must not exist, otherwise its current revision number and
+    strong ETag), the media type of the new revision, and 1..100 ordered
+    source fragments -- each a path, a revision number, a strong ETag and
+    a half-open ``[start, end)`` byte interval.  One transaction:
+
+    1. inserts a placeholder row for the target (never for sources) and
+       locks EVERY involved object row -- target and sources alike --
+       FOR UPDATE in one ascending-path statement, the same global lock
+       order publishers, moves, copy sessions, lease creation and GC
+       execute use; one lock strength and one acquisition order mean a
+       composition racing a PUT, a move or another composition serialises
+       instead of deadlocking, and GC cannot delete a source revision
+       while its bytes are being read;
+    2. checks the target baseline against the locked current revision
+       (412 on mismatch);
+    3. resolves each source revision in request order under those locks
+       (404 when the revision is not stored any more, 412 when its strong
+       ETag differs from the request's, 400 when the fragment range runs
+       past the revision's length) and copies the exact bytes;
+    4. concatenates the fragments in request order and publishes them as
+       the target's next revision.
+
+    Fragments are read from pinned, immutable revision rows, so a source
+    path that is also the target still contributes the bytes of the OLD
+    revision the client named, and any failure rolls the whole
+    transaction back -- a failed composition never leaves a target
+    revision (or a placeholder row) behind.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _composition_bad_request("request body must be valid JSON")
+    parsed = _parse_composition(body)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    target_path, baseline, media_type, sources = parsed
+
+    pool = request.app.state.pool
+    conn = await pool.acquire()
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        try:
+            await database.lock_composition_scope(
+                conn, target_path, [s.path for s in sources]
+            )
+
+            # The baseline is the client's belief about the target's
+            # current state, checked under the row lock: a concurrent
+            # PUT/move either already committed (and is seen here) or
+            # waits until this transaction commits.
+            target = await database.current_revision_locked(conn, target_path)
+            if baseline is None:
+                baseline_ok = target is None
+            else:
+                baseline_ok = (
+                    target is not None
+                    and target.revision_no == baseline[0]
+                    and target.sha256 == baseline[1]
+                )
+            if not baseline_ok:
+                await tx.rollback()
+                return JSONResponse(
+                    {
+                        "detail": "target_baseline_mismatch",
+                        "target_path": target_path,
+                        "current_etag": (
+                            str(make_etag(target.sha256)) if target else None
+                        ),
+                        "current_revision_no": (
+                            target.revision_no if target else None
+                        ),
+                    },
+                    status_code=412,
+                    headers=validator_headers(target) if target else {},
+                )
+
+            fragments: list[bytes] = []
+            for index, source in enumerate(sources):
+                rev = await database.fetch_stored_revision(
+                    conn, source.path, source.revision_no
+                )
+                if rev is None:
+                    await tx.rollback()
+                    return JSONResponse(
+                        {
+                            "detail": "source_revision_not_found",
+                            "source_index": index,
+                            "path": source.path,
+                            "revision_no": source.revision_no,
+                        },
+                        status_code=404,
+                    )
+                if rev.sha256 != source.etag_opaque:
+                    await tx.rollback()
+                    return JSONResponse(
+                        {
+                            "detail": "source_etag_mismatch",
+                            "source_index": index,
+                            "path": source.path,
+                            "revision_no": source.revision_no,
+                            "current_etag": str(make_etag(rev.sha256)),
+                        },
+                        status_code=412,
+                        headers=validator_headers(rev),
+                    )
+                if source.end > rev.length:
+                    await tx.rollback()
+                    return JSONResponse(
+                        {
+                            "detail": "fragment_out_of_range",
+                            "source_index": index,
+                            "path": source.path,
+                            "revision_no": source.revision_no,
+                            "start": source.start,
+                            "end": source.end,
+                            "length": rev.length,
+                        },
+                        status_code=400,
+                    )
+                fragments.append(
+                    await database.fetch_revision_slice(
+                        conn, rev.id, source.start, source.end
+                    )
+                )
+
+            content = b"".join(fragments)
+            digest, revision_no, created_at = await database.publish_revision(
+                conn, target_path, content, media_type
+            )
+            await tx.commit()
+        except Exception:
+            await tx.rollback()
+            raise
+    finally:
+        await pool.release(conn)
+
+    etag = make_etag(digest)
+    return JSONResponse(
+        {
+            "target_path": target_path,
+            "revision_no": revision_no,
+            "etag": str(etag),
+            "bytes": len(content),
+        },
+        status_code=201,
+        headers={
+            "ETag": str(etag),
+            "Last-Modified": http_date(created_at),
+            "X-Revision-No": str(revision_no),
         },
     )
 

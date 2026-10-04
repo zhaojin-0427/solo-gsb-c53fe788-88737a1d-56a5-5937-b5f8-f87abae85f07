@@ -17,6 +17,7 @@
 - **历史修订租约**：`POST /revision-leases` 提交 `path`、**正整数** `revision_no` 与 `ttl_seconds`（**60～86400 秒**），只能为**仍在库中**的修订（含当前修订、含已迁走路径下残留的历史修订）创建：服务先对对象行加 `FOR UPDATE` 行锁再查修订——与 `/gc` 执行共用同一全局锁序，因此**创建与回收按对象行严格串行**，要么租约先生效（`/gc` 的锁内重判定看到它、保留该修订），要么回收先提交（租约请求得到 404），绝不会"租约成功却丢了修订"。成功返回 **201**、随机租约 ID（32 位十六进制）、数据库时钟计算的 `created_at`/`expires_at` 以及绑定修订的强 ETag（响应头同时带 `ETag`/`Last-Modified`）；修订不存在返回 **404**（`revision_not_found`），参数非法返回 **400**。`GET/HEAD /revision-leases/{id}/content` 按**绑定的旧修订**执行与 `/objects` 完全相同的前置条件（304/412）与 Range/If-Range 规则（200/206/416）；绑定在创建时确定，**路径重新发布、迁移或重放请求都不改变响应**。读取先查租约再对对象行加 `FOR SHARE`、随后复查租约状态与修订是否存在，事务一直持有到最后一个字节——**读取开始后即使租约到期或被释放，流仍完整、元数据始终属于绑定修订**，`/gc` 会等待流结束才能删除。`DELETE /revision-leases/{id}` **幂等释放**：活动、已释放、已过期的租约都返回 204，从未存在的 ID 返回 **404**；释放/过期后再读内容返回 **410**（`lease_released` / `lease_expired`，含路径、修订号与时间戳），修订本身随后才可能被下一次 `/gc` 回收。
 - **对象路径迁移**：`POST /moves` 提交非空且互不相同的 `source_path`、`target_path`、`source_etag`（强 ETag）与正整数 `source_revision_no`；仅当**源强 ETag 与修订号都匹配当前修订、且目标当前无内容**时，按路径升序同时锁住两端，在**一个事务**内把源内容与媒体类型发布为目标的**新修订**（目标侧按自身历史 `max+1` 编号），并把源路径摘除（其 GET/HEAD 随即 **404**）。源不存在（含已迁走）返回 **404**，源已变（ETag 或修订号不符）返回 **412**（响应带当前 ETag/修订号），目标已有内容返回 **409**；任何失败整事务回滚，不留部分生效。已迁走的路径再次 PUT 或作为迁移目标复用时，修订号由每路径高水位线 `revision_seq` 锚定，**只增不复用、不回退**——即便旧修订已被 `/gc` 全部清理。
 - **对象索引（十分钟快照分页）**：`GET /object-index?prefix=&limit=&cursor=` 按路径升序列举当前对象，每条固化 `path`、`revision_no`、`ETag`、`media_type`、`bytes` 五项元数据。`prefix` 可省略（空串表示**全量**），`limit` 缺省 **50**、强制 **1～100**；首次请求由索引模块在**无行锁**的可重复读快照中遍历对象并把结果物化为一份**十分钟快照**（建快照不阻塞任何 PUT、迁移、复制或回收），随后用返回的 `next_cursor` 翻页时先校验 HMAC 签名与其中的 `prefix`、`limit`、快照 ID，再**只回放该快照副本**——翻页期间发生 PUT、路径迁移或历史回收都**不改变、不重复、不遗漏**任何条目；游标伪造、参数非法或与游标不符返回 **400**，快照过期（或已清理）返回 **410**（`snapshot_expired`），重新发起无游标请求即建立新快照。每次请求顺带清理过期快照：清理是页事务**之外**独立的读已提交 DELETE，多个请求同时清理同一份过期快照时在行锁上串行（输家删除 0 行），不会触发可重复读 40001 而返回 500；而存活判定与取页仍在同一个可重复读事务内，单页的过期裁决与内容始终一致。
+- **对象合成**：`POST /compositions` 提交目标路径、目标基线（目标不存在为 `null`，否则为当前修订号及强 ETag）、媒体类型与有序的 **1～100** 个源片段（每段：路径、修订号、强 ETag 与**左闭右开**字节区间 `[start, end)`）；服务在**单一事务**内先为目标路径插入占位行（源路径绝不新建），再用一条按路径升序的语句对目标与全部源路径的对象行加 `FOR UPDATE`——与 PUT、迁移、复制会话、租约、`/gc` 同一全局锁序、同一锁强度，并发下串行而不死锁，且 `/gc` 在合成期间删不掉正在读取的源修订——锁内核验目标基线与每个源修订的强 ETag，按请求顺序拼接原字节后发布为目标新修订，返回修订号、ETag 与总字节数。相同源可重复取段；空段或越界返回 **400**，源修订不在库返回 **404**，源 ETag 或目标基线不符返回 **412**；任何失败整事务回滚、不留目标修订。目标与源同路径时仍从指定的旧修订取段，并发 PUT 的新字节不会混入。
 
 ## 快速启动（Docker Compose）
 
@@ -49,6 +50,7 @@ curl http://localhost:8000/healthz
 | `GET` / `HEAD` | `/revision-leases/{id}/content` | 按绑定的旧修订执行条件请求与 Range 规则（200/206/304/412/416）；未知 ID 404，租约过期或已释放 410；读取开始后到期/释放不影响进行中的流 |
 | `DELETE` | `/revision-leases/{id}` | 幂等释放租约（活动/已释放/已过期均 204）；未知 ID 404 |
 | `GET` | `/object-index` | 按路径升序分页列举对象（`prefix` 可空=全量、`limit` 缺省 50/范围 1～100、`cursor` 翻页）；首次建立十分钟快照，之后回放同一快照；非法参数/篡改游标 400，快照过期 410 |
+| `POST` | `/compositions` | 对象合成：按序拼接 1～100 个源修订的 `[start, end)` 字节片段，单事务发布目标新修订；201 返回修订号/ETag/总字节数；空段或越界 400、源修订不存在 404、源 ETag 或目标基线不符 412，失败不留目标修订 |
 | `GET` | `/healthz` | 健康检查 |
 
 支持的条件头：`If-Match`、`If-None-Match`、`If-Modified-Since`、`If-Unmodified-Since`（PUT/GET/HEAD 均按 §13.2.2 顺序求值）。
@@ -670,6 +672,236 @@ curl -i "http://localhost:8000/object-index?prefix=logs/2026/&limit=2&cursor=<ol
 
 快照只是元数据的只读副本（不保存正文、也**不**成为 `/gc` 的保留依据）：历史修订在快照期间被回收、对象被 `POST /moves` 迁走，已冻结的索引页照常返回，实时路径读取则按迁移/回收后的现状响应。
 
+## 对象合成（POST /compositions）
+
+把 1～100 个**仍在库中的修订**的字节片段按请求顺序拼接，作为目标路径的**新修订**在单一事务内原子发布。
+
+- 请求体四个字段：`target_path`（非空字符串）；`target_baseline`（目标应不存在时为 `null`，否则为 `{"revision_no": <正整数>, "etag": "<强 ETag>"}`，即客户端所认定的目标当前修订身份）；`media_type`（新修订的媒体类型）；`sources`（**1～100 个有序片段**，每段含 `path`、`revision_no`（正整数）、`etag`（强 ETag，`W/` 弱形式 400）、`start`/`end`——**左闭右开**字节区间 `[start, end)`，须满足 `0 <= start < end <= 修订长度`）。
+- 成功返回 **201**：响应体 `{"target_path", "revision_no", "etag", "bytes"}`（总字节数），响应头带 `ETag` / `Last-Modified` / `X-Revision-No`。目标路径随即以新修订提供拼接字节与媒体类型；条件请求、Range、复制会话、回收等语义与 PUT 发布的修订完全一致。
+- 相同源可重复取段；**片段顺序即语义**——交换顺序得到不同字节与不同 ETag。
+- 错误（按片段顺序逐个核验，报告第一个失败）：字段非法或空段（`end <= start`）→ **400**；`end` 超过修订长度 → **400** `fragment_out_of_range`；源修订不在库中（含已被 `/gc` 回收）→ **404** `source_revision_not_found`；源强 ETag 不符 → **412** `source_etag_mismatch`；目标基线不符（`null` 但目标已存在，或修订号/ETag 与当前不符）→ **412** `target_baseline_mismatch`（响应带当前 ETag/修订号）。**任何失败整事务回滚**：不留目标修订、不留占位行，已存在的目标保持原样。
+- **并发裁决（源修订钉住与目标锁定的顺序）**：事务先**仅为目标路径**插入占位行（源路径绝不新建——对象行从不被删除，无行即无修订，直接 404，失败不留痕迹），再用**一条按路径升序的语句**对目标与全部源路径的对象行加 `FOR UPDATE`——与 PUT、迁移、复制会话建档/确认、租约创建、`/gc` 执行共用同一全局锁序、同一锁强度。因此：合成期间 `/gc` 无法删除正在读取的源修订（它必须等待同一批行锁）；并发 PUT/迁移/另一合成要么先提交（被锁内基线与源核验看到）、要么等待本事务提交；两个合成即使源/目标角色互换也按同一顺序取锁，**不会死锁**。锁到手后才经修订读取层按 `(path, revision_no)` 查修订——修订行不可变，故**目标与源同路径**时仍取客户端指定的旧修订字节，并发 PUT 发布的新修订字节绝不混入；合成提交后不为源留下任何保留引用，下一轮 `/gc` 可正常回收旧源修订。
+
+```bash
+# 0. 启动（对象合成随主服务一起提供，无需额外服务）
+docker compose up --build
+curl http://localhost:8000/healthz        # {"status":"ok"}
+
+# 1. 准备两个源对象（记下各自的强 ETag 与修订号）
+curl -si -X PUT --data-binary 'HEADER;' -H 'Content-Type: application/x-part' \
+  http://localhost:8000/objects/parts/a.bin | grep -iE 'etag|x-revision-no'
+# etag: "e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d"
+# x-revision-no: 1
+curl -si -X PUT --data-binary 'footer.' -H 'Content-Type: application/x-part' \
+  http://localhost:8000/objects/parts/b.bin | grep -iE 'etag|x-revision-no'
+# etag: "fa9beb34567564dd0a25f8e462c313f25bbdbdfcaee438f4d46b7eb36181d8d4"
+# x-revision-no: 1
+
+# 2. 合成：a 的 [0,4) + b 的 [0,7) + 再取 a 的 [4,7)；目标尚不存在（baseline 为 null）
+curl -i -X POST http://localhost:8000/compositions \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "target_path": "assembled/report.bin",
+        "target_baseline": null,
+        "media_type": "application/x-composed",
+        "sources": [
+          {"path": "parts/a.bin", "revision_no": 1,
+           "etag": "\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+           "start": 0, "end": 4},
+          {"path": "parts/b.bin", "revision_no": 1,
+           "etag": "\"fa9beb34567564dd0a25f8e462c313f25bbdbdfcaee438f4d46b7eb36181d8d4\"",
+           "start": 0, "end": 7},
+          {"path": "parts/a.bin", "revision_no": 1,
+           "etag": "\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+           "start": 4, "end": 7}
+        ]
+      }'
+# HTTP/1.1 201 Created
+# etag: "924c4a0a5bfa49c8ba9dc6935abba51d66eb05aea45f4e76257354b68d5a30d4"
+# last-modified: Sun, 04 Oct 2026 06:24:36 GMT
+# x-revision-no: 1
+#
+# {"target_path":"assembled/report.bin","revision_no":1,
+#  "etag":"\"924c4a0a5bfa49c8ba9dc6935abba51d66eb05aea45f4e76257354b68d5a30d4\"",
+#  "bytes":14}
+
+# 3. GET 目标：按序拼接的字节 "HEAD" + "footer." + "ER;"，媒体类型为合成时指定值
+curl -i http://localhost:8000/objects/assembled/report.bin
+# HTTP/1.1 200 OK
+# etag: "924c4a0a5bfa49c8ba9dc6935abba51d66eb05aea45f4e76257354b68d5a30d4"
+# accept-ranges: bytes
+# content-type: application/x-composed
+# content-length: 14
+#
+# HEADfooter.ER;
+
+# 4. 顺序即语义：交换两个片段，得到不同字节与不同 ETag
+curl -s -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"assembled/swapped.bin","target_baseline":null,
+       "media_type":"application/x-composed",
+       "sources":[
+         {"path":"parts/b.bin","revision_no":1,
+          "etag":"\"fa9beb34567564dd0a25f8e462c313f25bbdbdfcaee438f4d46b7eb36181d8d4\"",
+          "start":0,"end":7},
+         {"path":"parts/a.bin","revision_no":1,
+          "etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+          "start":0,"end":7}]}'
+# {"target_path":"assembled/swapped.bin","revision_no":1,
+#  "etag":"\"6d22e64280ec8354363e4f4dc12844d802d42f0a449636d58843472fb786b37c\"",
+#  "bytes":14}
+curl -s http://localhost:8000/objects/assembled/swapped.bin     # footer.HEADER;
+
+# 5. 带基线重新合成同一目标：基线=当前修订身份，发布为下一修订号
+curl -si -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"assembled/report.bin",
+       "target_baseline":{"revision_no":1,
+         "etag":"\"924c4a0a5bfa49c8ba9dc6935abba51d66eb05aea45f4e76257354b68d5a30d4\""},
+       "media_type":"application/x-composed",
+       "sources":[{"path":"parts/a.bin","revision_no":1,
+         "etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+         "start":0,"end":7}]}' | grep -iE '^(HTTP|etag|x-revision-no)'
+# HTTP/1.1 201 Created
+# etag: "e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d"
+# x-revision-no: 2
+
+# 6. 冲突与错误（任何失败都不留目标修订）
+# 6a. 基线为 null 但目标已存在 -> 412，响应带当前 ETag/修订号
+curl -i -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"assembled/report.bin","target_baseline":null,
+       "media_type":"application/x-composed",
+       "sources":[{"path":"parts/a.bin","revision_no":1,
+         "etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+         "start":0,"end":4}]}'
+# HTTP/1.1 412 Precondition Failed
+# etag: "e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d"
+# {"detail":"target_baseline_mismatch","target_path":"assembled/report.bin",
+#  "current_etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+#  "current_revision_no":2}
+
+# 6b. 源 ETag 不符（把 b 的 ETag 安到 a 上）-> 412
+curl -s -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"assembled/new.bin","target_baseline":null,
+       "media_type":"application/x-composed",
+       "sources":[{"path":"parts/a.bin","revision_no":1,
+         "etag":"\"fa9beb34567564dd0a25f8e462c313f25bbdbdfcaee438f4d46b7eb36181d8d4\"",
+         "start":0,"end":4}]}'
+# {"detail":"source_etag_mismatch","source_index":0,"path":"parts/a.bin",
+#  "revision_no":1,
+#  "current_etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\""}
+
+# 6c. 源修订不在库中 -> 404
+curl -s -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"assembled/new.bin","target_baseline":null,
+       "media_type":"application/x-composed",
+       "sources":[{"path":"parts/a.bin","revision_no":9,
+         "etag":"\"e46f4941e304648f24f817aea765ed428acbae93fc93acfe9e3e798a74b9499d\"",
+         "start":0,"end":4}]}'
+# {"detail":"source_revision_not_found","source_index":0,"path":"parts/a.bin","revision_no":9}
+
+# 6d. 片段越界（a 只有 7 字节，end=8）-> 400
+# {"detail":"fragment_out_of_range","source_index":0,"path":"parts/a.bin",
+#  "revision_no":1,"start":0,"end":8,"length":7}
+
+# 6e. 空段（end <= start）-> 400
+# {"detail":"sources[0] must satisfy start < end (got start=3, end=3)"}
+
+# 失败不留痕迹：上述失败的目标仍 404，已有目标保持原样
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8000/objects/assembled/new.bin
+# 404
+curl -s http://localhost:8000/objects/assembled/report.bin    # HEADER;（仍是第 5 步的结果）
+
+# 7. 目标与源同路径：仍从指定的旧修订取段，发布为下一修订
+curl -s -X PUT --data-binary 'self-v1'        http://localhost:8000/objects/self.txt
+curl -s -X PUT --data-binary 'self-v2-longer' http://localhost:8000/objects/self.txt
+# （"self-v1" 的 ETag 为 "3a558570...da4f"，"self-v2-longer" 的为 "87d6dea8...2766"，均为确定值）
+curl -s -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"self.txt",
+       "target_baseline":{"revision_no":2,
+         "etag":"\"87d6dea860319ccf16924f4fce07c349821abfd712dfd15cb4e9d0a1716e2766\""},
+       "media_type":"text/plain",
+       "sources":[
+         {"path":"self.txt","revision_no":1,
+          "etag":"\"3a558570647d9999768c30f2cefd00b15505189ec25facf81de8d6203763da4f\"",
+          "start":0,"end":4},
+         {"path":"self.txt","revision_no":2,
+          "etag":"\"87d6dea860319ccf16924f4fce07c349821abfd712dfd15cb4e9d0a1716e2766\"",
+          "start":5,"end":8}]}'
+# {"target_path":"self.txt","revision_no":3,
+#  "etag":"\"85c512e56429546c2cb41d3c3850e72a2b547c25a538c45fed0dc8a9b567802f\"","bytes":7}
+curl -s http://localhost:8000/objects/self.txt    # selfv2-（"self" + "v2-"）
+
+# 8. 合成不为源留下保留引用：旧源修订随后可被 /gc 正常回收，合成结果不受影响
+curl -s -X PUT --data-binary 'collect-me-v1' http://localhost:8000/objects/gc-src.txt
+curl -s -X PUT --data-binary 'keep-v2'       http://localhost:8000/objects/gc-src.txt
+curl -s -X POST http://localhost:8000/compositions -H 'Content-Type: application/json' \
+  -d '{"target_path":"gc-out.txt","target_baseline":null,"media_type":"text/plain",
+       "sources":[{"path":"gc-src.txt","revision_no":1,
+         "etag":"\"1d25eb00b482a25941c05900541b2b5b3fceb0d12b13844c0dd533328ad75010\"",
+         "start":0,"end":7}]}'
+# {"target_path":"gc-out.txt","revision_no":1,"etag":"\"81824c90...\"","bytes":7}
+curl -s -X POST http://localhost:8000/gc -H 'Content-Type: application/json' \
+  -d '{"paths":["gc-src.txt"],"before":"2099-01-01T00:00:00Z","dry_run":false}'
+# {"dry_run":false,...,"deleted":[{"path":"gc-src.txt","revision_no":1,"bytes":13}],
+#  "deleted_count":1,"deleted_bytes":13,
+#  "retained":[{"path":"gc-src.txt","revision_no":2,"reasons":["current"]}]}
+curl -s http://localhost:8000/objects/gc-out.txt    # collect（不受影响）
+```
+
+并发验证：合成（基线 `null`）与目标路径首个 PUT 在对象行锁上串行——PUT 先提交则合成 412 `target_baseline_mismatch`，合成先提交则 PUT 接续为修订 2；两种交错都不会出现 500 或重复修订号：
+
+```bash
+python3 - <<'PY'
+import json, threading, urllib.request, uuid, hashlib
+
+BASE = "http://localhost:8000"
+
+def request(method, path, body=None, raw=None):
+    data = raw if raw is not None else (
+        json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(BASE + path, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:      # 4xx 也是合法结果
+        return e.code, e.headers, e.read()
+
+tag = uuid.uuid4().hex[:12]
+src, dst = f"race/{tag}/src.bin", f"race/{tag}/out.bin"
+request("PUT", f"/objects/{src}", raw=b"source-bytes")
+etag = '"' + hashlib.sha256(b"source-bytes").hexdigest() + '"'
+
+barrier = threading.Barrier(2)
+out = {}
+def compose():
+    barrier.wait()
+    out["comp"] = request("POST", "/compositions", {
+        "target_path": dst, "target_baseline": None,
+        "media_type": "application/octet-stream",
+        "sources": [{"path": src, "revision_no": 1, "etag": etag,
+                     "start": 0, "end": 6}]})
+def put():
+    barrier.wait()
+    out["put"] = request("PUT", f"/objects/{dst}", raw=b"put-bytes")
+threading.Thread(target=compose).start(); threading.Thread(target=put).start()
+for th in [t for t in threading.enumerate() if t is not threading.main_thread()]:
+    th.join()
+
+comp_status, _, comp_body = out["comp"]
+put_status, put_headers, _ = out["put"]
+print("COMP:", comp_status, comp_body.decode())
+print("PUT:", put_status, "X-Revision-No =", put_headers["X-Revision-No"])
+assert comp_status in (201, 412)              # 永远不是 500
+assert put_status == 204
+assert int(put_headers["X-Revision-No"]) == (1 if comp_status == 412 else 2)
+PY
+# 一次实际运行的输出（PUT 先提交的交错）：
+# COMP: 412 {"detail":"target_baseline_mismatch","target_path":"race/.../out.bin",
+#            "current_etag":"\"1002a12e...\"","current_revision_no":1}
+# PUT: 204 X-Revision-No = 1
+# 多跑几次也会出现合成先提交的交错：COMP 201（修订 1），PUT 204 X-Revision-No = 2。
+```
+
 ## 本地开发
 
 ```bash
@@ -694,6 +926,7 @@ python -m pytest
 - `tests/test_gc.py`：历史修订回收端到端测试，覆盖请求校验（路径数 1～100、`before`、`dry_run`）、路径不存在整次 404 且执行路径不删任何修订（整批回滚）、空占位行视为不存在、预览分类与零副作用、截止时间的严格小于语义、路径去重与排序、执行后重放返回空清单、修订号不复用继续递增、清单/基线/租约引用保留与原因合并、混合对象只回收未钉住修订且确认仍可应用，以及并发安全：**流式 GET 期间回收等待且不误删在读修订**、回收与 PUT 交错不删新修订且编号连续、回收与确认交错清单钉住的修订必存活、两个并发执行在锁内重判定收敛（每个修订只删一次）。
 - `tests/test_revision_leases.py`：历史修订租约端到端测试，覆盖创建参数校验（路径非空、正整数修订号、TTL 60～86400 且拒绝 bool/float/字符串、边界值 60/86400）、201 响应（随机 32 位十六进制 ID 每次不同、ETag 为绑定修订强 ETag、`expires_at - created_at` 恰为 TTL）、修订不存在/已回收均 404、GET/HEAD 服务**绑定的旧修订**（内容、媒体类型、Content-Length 与 ETag 一致）、条件请求（304/412 针对旧修订而非当前修订）、Range/If-Range/多段 multipart 及 416、重发/重新发布/路径迁移后响应不变、已迁走路径残留历史可租、`/gc` 预览与执行均报告 `revision_lease` 原因且不删除被钉修订（原因与 `current` 合并）、释放与到期后不再保留且读取为 410（区分 `lease_released`/`lease_expired` 与载荷字段）、DELETE 幂等（活动/重复/过期均 204）与未知 ID 404、**2 MiB 流读取期间释放或到期 + /gc 交错时流完整且元数据一致、/gc 等待流结束后才删除**，以及**租约创建与 /gc 在对象行锁上串行：8 轮屏障压测只出现"租约先生效→修订保留且可读"或"回收先提交→租约 404"两种合法结局**。
 - `tests/test_moves.py`：对象路径迁移端到端测试，覆盖请求体校验（字段必填、路径非空且不同、强 ETag、正整数修订号）、成功迁移后目标以自身修订号提供相同内容/媒体类型而源 GET/HEAD 为 404、目标编号接续目标自身历史、404（源缺失/已迁走）/412（ETag、修订号或两者不符并回带当前校验值）/409（目标已有内容）均无部分生效、失败回滚后目标仍可 `If-None-Match: *` 首建、**已迁走路径再次 PUT 或作为目标复用时修订号只增不复用、且在 /gc 清空历史后仍由 `revision_seq` 保持单调**、迁移前会话仍可拉取固定源修订且变化的目标基线按原规则 409、/gc 只清理未被会话引用的旧修订而不误删钉住修订，以及并发：同源发散迁移恰一个成功（另一个 404）、争同一目标恰一个成功（另一个 409）、重叠锁集的交叉迁移不死锁且结果为合法串行历史、迁移与目标首发布交错（PUT 先则 409、迁移先则 PUT 接续修订 2，无 500/无重复编号）、流式 GET 期间迁移等待且不撕裂响应。
+- `tests/test_compositions.py`：对象合成端到端测试，覆盖请求体校验（四字段必填、强 ETag、正整数修订号、非负整数边界、空段 `end <= start`、1～100 片段上限与恰好 100 段）、按序拼接与左闭右开区间语义（`end == 长度` 合法、相邻段精确拼接）、同源重复取段、从旧修订（非当前修订）取段、**目标与源同路径自我合成**、已迁走目标的编号接续、目标基线（`null` 要求目标不存在、匹配后发布下一修订号、不符 412 回带当前校验值）、源修订不存在 404（含已被 `/gc` 回收的修订）、源 ETag 不符 412、越界 400、按片段顺序报告首个失败、失败不留目标修订与占位行（目标随后仍可 `If-None-Match: *` 首建）、合成修订的条件请求/Range/乐观写语义不变、合成不为源留下 GC 保留引用、从已迁走路径残留修订与租约钉住修订取段，以及并发：**与目标首 PUT 串行（PUT 先则 412、合成先则 PUT 接续修订 2，无 500/无重复编号）**、**源路径并发 PUT 绝不混入新字节（总是钉住的旧修订字节）**、**与 /gc 执行串行（GC 先则 404、合成先则 201 且源修订随后被回收，无死锁）**、与源迁移并发双方成功、源/目标角色互换的两个合成按同一锁序串行不死锁。
 
 ## 设计要点
 
@@ -711,3 +944,4 @@ python -m pytest
 - **对象路径迁移**：`POST /moves` 在单事务内先为两端（按需）插入占位行，再用一条按路径升序的纯 `FOR UPDATE` 同时锁住源与目标的 `objects` 行——与 PUT、建档、确认、回收完全相同的全局锁序，交叉/交换端点的迁移也按同一顺序取锁，串行化而不死锁——锁到手后才 LEFT JOIN `revisions` 读取两端当前修订并按 **404（源无当前修订）→ 412（源强 ETag 或修订号不符）→ 409（目标已有内容）** 顺序判定；全部满足时，把源当前修订的**字节与媒体类型**经 `publish_revision` 作为目标的**全新修订**插入（新的修订 `id`，修订号按目标自身历史 `max+1`），再把源行 `current_id` 置 NULL 摘除——插入新修订与摘除源在同一事务提交，任何失败整批回滚，外部永远看不到部分迁移。迁移不复制修订行本身：它在目标路径新建修订，因此源路径的旧修订行保持原样、仍被迁移前的复制会话清单/基线钉住，`/gc` 据此正常保留。每路径的 `objects.revision_seq` 高水位线在每次发布时随 `revision_no` 一起推进；摘除源行不清零。发布编号取 `GREATEST(revision_seq, max(revision_no)) + 1`，于是已迁走路径（行在但 `current_id` 为 NULL，且其旧修订可被 `/gc` 全部删除）再次 PUT 或作为迁移目标复用时，编号只从旧高水位 +1 继续——绝不回退、绝不复用。
 - **历史修订租约**：`revision_leases(id, object_path, revision_id, revision_no, created_at, expires_at, released_at)` 是 `/gc` 的第四种保留事实，分类 SQL 在锁内多算一个 `EXISTS (... released_at IS NULL AND expires_at > now())`，预览原因记为 `revision_lease`（可与 `current`/`copy_manifest`/`target_baseline` 叠加）。该表**故意不加指向 `revisions` 的外键**：租约过期或释放后修订可以被回收，而租约行必须保留，读取才能回答 410（曾经存在但已失效）而非 404（从未存在）；"租约是否有效"是动态时间谓词，无法由外键表达，一致性改由**对象行锁 + 读取事务持锁到流末**保证（见下）。创建租约在单事务内先用一条**不连接 `revisions` 的纯 `FOR UPDATE`** 锁住对象行（不补占位行——租约不创建对象），锁到手后才按 `(object_path, revision_no)` 查修订：与 `/gc` 执行的"先锁行后分类"在同一全局路径锁序上严格串行——租约先提交则其 INSERT 在 GC 事务快照内可见、修订被保留；GC 先提交则修订已删除、查得 NULL 返回 404，因此"租约成功却丢失修订"在调度上不可达。租约 ID 用 `secrets.token_hex(16)` 随机生成，过期时间由 PostgreSQL `now() + make_interval(secs => ttl)` 计算，与 GC 判定共用同一数据库时钟。内容读取分三步：①无锁读租约行（未知 ID → 404）；②对其 `object_path` 加 `FOR SHARE`；③**锁内复查**租约是否仍未释放且未过期、绑定修订是否仍存在（释放→410 `lease_released`，过期/已回收→410 `lease_expired`），随后复用 `/objects` 的同一套前置条件求值与 Range 计划，并由共享的流式助手在末字节发送后才提交事务。因此一旦读取开始，租约到期、`DELETE` 释放、路径迁移或重新发布都无法改变该响应：GC 的 `FOR UPDATE`/DELETE 会等待 `FOR SHARE` 释放，流完才可能删除；而 HEAD/304/412/416 在同一事务内立即提交。`DELETE` 用 `UPDATE ... WHERE released_at IS NULL AND expires_at > now()` 做条件更新，活动→本次释放、已释放/已过期→幂等 204，仅查无此行才 404。
 - **对象索引快照**：`GET /object-index` 首次请求把 `objects JOIN revisions`（当前修订；INNER JOIN 自然排除已迁走的 `current_id` NULL 行与空占位行）按 `path ASC` 遍历的结果**复制**到 `object_index_snapshots(id, prefix, page_limit, total, created_at, expires_at)` 与 `object_index_entries(snapshot_id, ordinal, path, revision_no, etag, media_type, bytes)`。遍历是普通 `SELECT`、**不带 `FOR SHARE/FOR UPDATE`**，运行在独立的可重复读事务中：建快照**不持有任何对象行锁**，因此 PUT/迁移/确认/回收永不被它阻塞，它也不阻塞它们（DB 层用"遍历事务未提交时写者带 `lock_timeout` 的 UPDATE 立即成功"确定性验证）。`object_index_entries` **故意不引用 `revisions`**：快照只是十分钟的**元数据只读副本**，不是第五种 GC 保留事实——历史修订在翻页期间被 `/gc` 删除、对象被 `POST /moves` 迁走，冻结页照常返回，而实时读写/复制/迁移/回收/租约语义完全不变。翻页只查副本（`(snapshot_id, ordinal)` 索引，`ORDER BY ordinal LIMIT/OFFSET`），偏移由游标承载，因此**不重复、不遗漏、可重放**；末页 `next_cursor` 为 `null`，重放末位置返回相同空页。游标 = HMAC-SHA-256 签名的 `(快照 ID, 偏移, prefix, limit)`，密钥独立存于 `service_meta`（`object_index_cursor_secret`，与复制游标密钥隔离），重启后仍有效；服务端先校验签名，再核对游标内 `prefix`/`limit` 与请求一致、快照头存在且选择一致，任一不符 → 400，快照缺失（从未存在或已清理）或 `expires_at <= now()` → 410。`expires_at` 由 PostgreSQL `now() + interval '10 min'` 计算；每次索引请求顺带 `DELETE ... WHERE expires_at <= now()` 清理过期行（条目随外键级联删除）。**清理与读页刻意分处两个事务边界**：清理是取页事务**之外**一条独立的读已提交 autocommit 语句，随后的"取快照头/判过期/取页"才在**同一个可重复读事务**内完成（存活判定与页内容共用一个数据库快照与一个 `now()`）。若把清理 `DELETE` 也放进可重复读事务，两个请求清理同一过期行时会在同一行上都打写标记：后拿行锁的一方在对方提交后做 first-updater-wins 复检，发现自己要删的行已被并发事务删除，提交时报 `40001 could not serialize access due to concurrent delete`，请求 500；拆成读已提交后，输家在行锁上等待、提交后重扫谓词匹配 0 行、删除 0 行，天然幂等、**无需序列化失败重试**。清理事务只能删掉"别的"快照——首查要建的快照在其后才创建，续页所指快照的存活/过期裁决则完全发生在读页事务的冻结快照内——所以清理竞争既不改变过期判定，也拆不掉已判存活的页，**单页一致性**不受影响。TTL（默认 600 秒）、缺省页大小（50）与上限（100）可由 `ORIGIN_OBJECT_INDEX_TTL_SECONDS` / `ORIGIN_OBJECT_INDEX_DEFAULT_LIMIT` / `ORIGIN_OBJECT_INDEX_MAX_LIMIT` 调整。
+- **对象合成**：`POST /compositions` 在单事务内先**仅为目标路径** `INSERT ... ON CONFLICT DO NOTHING` 补占位行（源路径绝不新建：对象行从不被删除，无行即无修订，直接 404，失败也不留痕迹），再用一条 `WHERE path = ANY(...) ORDER BY path ASC FOR UPDATE` 同时锁住目标与全部源路径的对象行——与所有写者同一全局锁序、同一锁强度，源/目标角色互换的两个合成、合成与迁移/PUT/回收都按首个共享行串行，不存在锁升级死锁；锁内依次核验目标基线（`null` ⟺ 无当前修订）、按片段顺序逐个经 `(object_path, revision_no)` 查修订（不存在 404）、比对强 ETag（不符 412）、校验 `[start, end)` 区间（越界 400），随后 `substring(content ...)` 取段、按请求顺序拼接、`publish_revision` 发布并提交。因为 `/gc` 执行与租约创建都要先拿同一批对象行锁，合成持锁期间源修订不会被回收；因为读的是不可变修订行，目标与源同路径时仍取指定旧修订的字节，并发 PUT 的新修订不会混入。合成不为源留下持久引用——提交后下一轮 `/gc` 即可正常回收旧源修订。片段数上限（默认 100）可由 `ORIGIN_COMPOSITION_MAX_SOURCES` 调整。
